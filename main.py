@@ -2,6 +2,7 @@ import sys
 import os
 import json
 from datetime import datetime
+from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QListWidget, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QToolBar, QMenu,
@@ -10,11 +11,34 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
-from PyQt6.QtCore import QUrl, QStandardPaths, QSize, QPoint, Qt
+from PyQt6.QtCore import QUrl, QStandardPaths, QSize, QPoint, Qt, QObject, pyqtSlot
 from PyQt6.QtGui import QAction, QFont, QColor, QIcon
 
 STORAGE_FILE = os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation), "storages.json")
 SETTINGS_FILE = "settings.json"
+
+from PyQt6.QtWebChannel import QWebChannel
+from PyQt6.QtCore import QObject, pyqtSlot
+
+class CloseBridge(QObject):
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+
+    @pyqtSlot()
+    def closeWindow(self):
+        self.window.close()
+
+
+class ConsoleBridge(QObject):
+    def __init__(self, console_widget):
+        super().__init__()
+        self.console_widget = console_widget
+
+    @pyqtSlot(str)
+    def log(self, message):
+        self.console_widget.append(f"[log] {message}")
+        self.console_widget.verticalScrollBar().setValue(self.console_widget.verticalScrollBar().maximum())
 
 class DevConsole(QDialog):
     def __init__(self, web_page: QWebEnginePage):
@@ -38,23 +62,77 @@ class DevConsole(QDialog):
         layout.addWidget(self.input)
         self.setLayout(layout)
 
+        self.console_bridge = ConsoleBridge(self.output)
+        self.channel = QWebChannel()
+        self.channel.registerObject("pyConsole", self.console_bridge)
+        self.web_page.setWebChannel(self.channel)
+
+        self.web_page.loadFinished.connect(self.inject_webchannel_js)
+
+    def inject_webchannel_js(self):
+        try:
+            possible_paths = [
+                os.path.join(sys.prefix, "Lib", "site-packages", "PyQt6", "Qt6", "resources", "qtwebchannel", "qwebchannel.js"),
+                os.path.join(sys.prefix, "Lib", "site-packages", "PyQt6", "Qt", "resources", "qtwebchannel", "qwebchannel.js"),
+            ]
+            qweb_js = None
+            for path in possible_paths:
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        qweb_js = f.read()
+                    break
+
+            if not qweb_js:
+                raise FileNotFoundError("qwebchannel.js not found in known paths.")
+
+            self.web_page.runJavaScript(qweb_js)
+
+            self.web_page.runJavaScript("""
+                (function() {
+                    function initHook() {
+                        if (typeof qt === 'undefined' || !qt.webChannelTransport) {
+                            setTimeout(initHook, 100);
+                            return;
+                        }
+                        new QWebChannel(qt.webChannelTransport, function(channel) {
+                            const pyConsole = channel.objects.pyConsole;
+                            const originalLog = console.log;
+                            console.log = function(...args) {
+                                try {
+                                    const message = args.map(a =>
+                                        typeof a === 'object' ? JSON.stringify(a) : String(a)
+                                    ).join(" ");
+                                    pyConsole.log(message);
+                                } catch (e) {}
+                                originalLog.apply(console, args);
+                            };
+                            console.log("✅ DevConsole hook active");
+                        });
+                    }
+                    initHook();
+                })();
+            """)
+        except Exception as e:
+            self.output.append(f'<span style="color: red;">❌ Failed to inject qwebchannel.js: {e}</span>')
+
     def run_command(self):
-        cmd = self.input.text()
-        if cmd.strip() == "":
+        cmd = self.input.text().strip()
+        if not cmd:
             return
+
         self.output.append(f"> {cmd}")
         self.input.clear()
 
         def handle_result(result):
-            self.output.append(str(result))
-
-        def handle_error(_):
-            self.output.append("Error running command.")
+            if result is not None:
+                formatted = json.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result)
+                self.output.append(f"[return] {formatted}")
+                self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum())
 
         try:
             self.web_page.runJavaScript(cmd, handle_result)
         except Exception as e:
-            self.output.append(f"Exception: {e}")
+            self.output.append(f'<span style="color: red;">❌ Exception: {e}</span>')
 
 class SettingsDialog(QDialog):
     def __init__(self, current_settings, parent=None):
@@ -115,7 +193,7 @@ class BrowserWindow(QMainWindow):
         reload_action.triggered.connect(self.browser.reload)
         self.toolbar.addAction(reload_action)
 
-        dev_action = QAction("Dev Console", self)
+        dev_action = QAction("Developer Console", self)
         dev_action.triggered.connect(self.open_dev_console)
         self.toolbar.addAction(dev_action)
 
@@ -132,13 +210,94 @@ class BrowserWindow(QMainWindow):
         corsunblock_button.triggered.connect(self.toggle_cors_unblock)
         self.toolbar.addAction(corsunblock_button)
 
-        external_terminal_button = QAction("External Terminal", self)
-        external_terminal_button.triggered.connect(self.open_external_terminal)
-        self.toolbar.addAction(external_terminal_button)
-
         system_button = QAction("System", self)
         system_button.triggered.connect(self.open_system_menu)
         self.toolbar.addAction(system_button)
+
+        self.profile_name = profile.persistentStoragePath().split("_")[-1]
+        self.browser.page().loadFinished.connect(self.check_storage_limit)
+
+    def check_storage_limit(self):
+        name = self.profile_name
+        base_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        storage_path = os.path.join(base_path, f"Profile_{name}")
+
+        size_bytes = 0
+        for root, _, files in os.walk(storage_path):
+            for f in files:
+                fp = os.path.join(root, f)
+                size_bytes += os.path.getsize(fp)
+        size_mb = round(size_bytes / (1024 * 1024), 2)
+
+        if os.path.exists(STORAGE_FILE):
+            with open(STORAGE_FILE, "r") as f:
+                all_storages = json.load(f)
+                data = all_storages.get(name, {})
+        else:
+            data = {}
+
+        limit_enabled = data.get("limit_enabled", False)
+        max_size = data.get("max_size_mb", 0)
+
+        if limit_enabled and size_mb > max_size:
+            self.browser.page().loadFinished.disconnect(self.check_storage_limit)
+
+            html = """
+            <html>
+            <head><style>
+                body {
+                    background-color: black;
+                    color: lime;
+                    font-family: "Lucida Console", monospace;
+                    padding: 40px;
+                    font-size: 16px;
+                }
+                .border {
+                    border: 2px solid lime;
+                    padding: 20px;
+                    max-width: 600px;
+                    margin: auto;
+                }
+                h1 {
+                    color: red;
+                    font-size: 20px;
+                }
+            </style></head>
+            <body>
+                <div class="border">
+                    <h1>*** DISK ERROR ***</h1>
+                    <p>LOCAL STORAGE HAS EXCEEDED ITS MAXIMUM ALLOWED SIZE.</p>
+                    <p>Please free up space or increase the size limit.</p>
+                </div>
+                <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+                <script>
+                    document.body.addEventListener("keydown", () => {
+                        if (typeof pyBridge !== "undefined") {
+                            pyBridge.closeWindow();
+                        }
+                    });
+                    new QWebChannel(qt.webChannelTransport, function(channel) {
+                        window.pyBridge = channel.objects.pyBridge;
+                    });
+                </script>
+            </body>
+            </html>
+            """
+
+            bridge = CloseBridge(self)
+            channel = QWebChannel()
+            channel.registerObject("pyBridge", bridge)
+            self.browser.page().setWebChannel(channel)
+
+            actions_to_remove = ["System", "CORS Unblock", "Restart", "Open Apps", "Developer Console"]
+
+            for action in self.toolbar.actions():
+                if action.text() in actions_to_remove:
+                    self.toolbar.removeAction(action)
+            
+            self.browser.setHtml(html)
+
+
 
     def open_system_menu(self):
         menu = QMenu(self)
@@ -157,6 +316,7 @@ class BrowserWindow(QMainWindow):
 
         button_pos = self.toolbar.mapToGlobal(QPoint(0, self.toolbar.height()))
         menu.popup(button_pos)
+
 
     def rename_object_dialog(self):
         dialog = QDialog(self)
@@ -234,29 +394,6 @@ class BrowserWindow(QMainWindow):
             dialog.accept()
 
         execute_button.clicked.connect(on_remove)
-        dialog.exec()
-
-
-    def open_external_terminal(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("External Terminal")
-
-        layout = QVBoxLayout(dialog)
-        input_box = QLineEdit(dialog)
-        input_box.setPlaceholderText("Enter command here...")
-        QMessageBox.warning(self, "External Terminal", "External terminal doesn't support some commands, please keep that in mind")
-        layout.addWidget(input_box)
-
-        execute_button = QPushButton("Execute", dialog)
-        layout.addWidget(execute_button)
-
-        def on_execute():
-            command = input_box.text()
-            js_command = f'w96.sys.execCmd("{command}")'
-            self.browser.page().runJavaScript(js_command)
-            dialog.accept()
-
-        execute_button.clicked.connect(on_execute)
         dialog.exec()
 
 
@@ -361,6 +498,7 @@ class BrowserWindow(QMainWindow):
             "Open Task Manager": "taskmgr",
             "Open Explorer": "explorer",
             "Open Settings": "ctrl",
+            "Open Run": "run",
         }
 
         for label, cmd in tools.items():
@@ -390,23 +528,53 @@ class CreateStorageDialog(QDialog):
         super().__init__()
         self.setWindowTitle("Create Windows 96 Local Storage")
         self.setMinimumSize(300, 150)
-        layout = QFormLayout()
+        self.form_layout = QFormLayout()
+        self.setLayout(self.form_layout)
 
         self.name_input = QLineEdit()
         self.version_combo = QComboBox()
         self.version_combo.addItems(versions)
 
-        layout.addRow("Storage Name:", self.name_input)
-        layout.addRow("Version:", self.version_combo)
+        self.enable_limit_checkbox = QCheckBox("Enable Max Size Limit")
+        self.enable_limit_checkbox.setChecked(False)
+        self.enable_limit_checkbox.toggled.connect(self.toggle_size_input)
+
+        self.size_input = QLineEdit()
+        self.size_input.setPlaceholderText("e.g., 500 (MB)")
+
+        self.form_layout.addRow("Storage Name:", self.name_input)
+        self.form_layout.addRow("Version:", self.version_combo)
+        self.form_layout.addRow(self.enable_limit_checkbox)
+        self.form_layout.addRow("Max Size (MB):", self.size_input)
 
         self.create_btn = QPushButton("Create")
         self.create_btn.clicked.connect(self.accept)
-        layout.addWidget(self.create_btn)
+        self.form_layout.addWidget(self.create_btn)
 
-        self.setLayout(layout)
+    def toggle_size_input(self, enabled):
+        self.size_input.setVisible(enabled)
+        label = self.form_layout.labelForField(self.size_input)
+        if label:
+            label.setVisible(enabled)
 
     def get_data(self):
-        return self.name_input.text(), self.version_combo.currentText()
+        return (
+            self.name_input.text(),
+            self.version_combo.currentText(),
+            self.enable_limit_checkbox.isChecked(),
+            self.size_input.text()
+        )
+
+
+    def get_data(self):
+        return (
+            self.name_input.text(),
+            self.version_combo.currentText(),
+            self.enable_limit_checkbox.isChecked(),
+            self.size_input.text()
+        )
+
+
 
 
 class WebLauncher(QMainWindow):
@@ -457,6 +625,15 @@ class WebLauncher(QMainWindow):
             f"Last Launched: {data.get('last_launched', 'Never')}\n"
             f"Size: {size_mb} MB"
         )
+
+        limit_enabled = data.get("limit_enabled", False)
+        info_text += f"\nLimit Enabled: {'Yes' if limit_enabled else 'No'}"
+
+        if limit_enabled and "max_size_mb" in data:
+            info_text += f"\nMax Allowed Size: {data['max_size_mb']} MB"
+            if size_mb > data["max_size_mb"]:
+                info_text += f"\n⚠️ Warning: Exceeds limit!"
+
         QMessageBox.information(self, f"Storage Info - {name}", info_text)
 
 
@@ -591,39 +768,124 @@ class WebLauncher(QMainWindow):
             item.setText(display)
             item.setData(Qt.ItemDataRole.UserRole, new_name)
 
-    def launch_website(self):
+    def launch_website(self):   
         selected = self.list_widget.currentItem()
         if selected:
             name = selected.data(Qt.ItemDataRole.UserRole)
             data = self.storages.get(name)
             if data:
-                url = self.websites.get(data["version"])
                 self.storages[name]["last_launched"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.save_storages()
 
+                base_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+                storage_path = os.path.join(base_path, f"Profile_{name}")
+
+                size_bytes = 0
+                for root, _, files in os.walk(storage_path):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        size_bytes += os.path.getsize(fp)
+                size_mb = round(size_bytes / (1024 * 1024), 2)
+
+                limit_enabled = data.get("limit_enabled", False)
+                max_size = data.get("max_size_mb", 0)
+
+                profile = self.create_profile(name)
+
+                if limit_enabled and size_mb > max_size:
+                    html = """
+                    <html>
+                    <head><style>
+                        body {
+                            background-color: black;
+                            color: lime;
+                            font-family: "Lucida Console", monospace;
+                            padding: 40px;
+                            font-size: 16px;
+                        }
+                        .border {
+                            border: 2px solid lime;
+                            padding: 20px;
+                            max-width: 600px;
+                            margin: auto;
+                        }
+                        h1 {
+                            color: red;
+                            font-size: 20px;
+                        }
+                    </style></head>
+                    <body>
+                        <div class="border">
+                            <h1>*** DISK ERROR ***</h1>
+                            <p>LOCAL STORAGE HAS EXCEEDED ITS MAXIMUM ALLOWED SIZE.</p>
+                            <p>Please free up space or increase the size limit.</p>
+                        </div>
+                        <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+                        <script>
+                            document.body.addEventListener("keydown", () => {
+                                if (typeof pyBridge !== "undefined") {
+                                    pyBridge.closeWindow();
+                                }
+                            });
+                        </script>
+                    </body>
+                    </html>
+                    """
+                    browser_window = BrowserWindow(f"Storage Full - {name}", "about:blank", profile)
+                    browser_window.browser.setHtml(html)
+                    bridge = CloseBridge(browser_window)
+                    channel = QWebChannel()
+                    channel.registerObject("pyBridge", bridge)
+                    browser_window.browser.page().setWebChannel(channel)
+
+                    browser_window.browser.page().runJavaScript("""
+                        new QWebChannel(qt.webChannelTransport, function(channel) {
+                            window.pyBridge = channel.objects.pyBridge;
+                        });
+                    """)
+                    browser_window.show()
+                    self.open_windows.append(browser_window)
+                    return
+
+                url = self.websites.get(data["version"])
                 if url:
-                    profile = self.create_profile(name)
                     browser_window = BrowserWindow(f"{data['version']} ({name})", url, profile)
                     browser_window.show()
                     self.open_windows.append(browser_window)
 
+
+
     def create_local_storage(self):
         dialog = CreateStorageDialog(self.websites.keys())
         if dialog.exec():
-            name, version = dialog.get_data()
+            name, version, enable_limit, max_size = dialog.get_data()
             if not name.strip():
                 QMessageBox.warning(self, "Invalid Name", "Storage name cannot be empty.")
                 return
             if name in self.storages:
                 QMessageBox.warning(self, "Duplicate Name", "Storage with this name already exists.")
                 return
-            self.storages[name] = {
+
+            entry = {
                 "version": version,
                 "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
+
+            if enable_limit:
+                try:
+                    size_limit = int(max_size)
+                    entry["limit_enabled"] = True
+                    entry["max_size_mb"] = size_limit
+                except ValueError:
+                    QMessageBox.warning(self, "Invalid Size", "Please enter a valid number for max size.")
+                    return
+            else:
+                entry["limit_enabled"] = False
+
+            self.storages[name] = entry
             self.save_storages()
-            display = name
-            item = QListWidgetItem(display)
+
+            item = QListWidgetItem(name)
             item.setData(Qt.ItemDataRole.UserRole, name)
             item.setFont(QFont("Arial", 10))
             item.setForeground(QColor("white"))
